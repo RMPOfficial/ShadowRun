@@ -1,5 +1,5 @@
-#pragma once
 #include <windows.h>
+#include "ShadowRun.h"
 
 #pragma optimize("", off)
 void optimized_zero_memory(void* ptr, size_t size) {
@@ -17,12 +17,19 @@ void optimized_zero_memory(void* ptr, size_t size) {
 
 HANDLE hStopEvent = NULL;
 static size_t threadCount = 0;
+static HWND hNotifyWindow = NULL;
+
+static void NotifyDone(int result)
+{
+	if (hNotifyWindow)
+		PostMessageW(hNotifyWindow, WM_SHADOW_DONE, (WPARAM)result, 0);
+}
 
 static DWORD WINAPI ShadowThread(LPVOID lpParam)
 {
 	HANDLE hProcess = (HANDLE)lpParam;
 
-	TCHAR filePath[MAX_PATH];
+	WCHAR filePath[MAX_PATH];
 	DWORD filePathSize = MAX_PATH;
 	QueryFullProcessImageNameW(hProcess, 0, filePath, &filePathSize);
 
@@ -36,6 +43,7 @@ static DWORD WINAPI ShadowThread(LPVOID lpParam)
 		if (MessageBoxA(NULL, errorMsg, "Error", MB_YESNO | MB_ICONERROR) == IDYES)
 			TerminateProcess(hProcess, 0);
 		CloseHandle(hProcess);
+		NotifyDone(SHADOW_SKIPPED);
 		return 0;
 	}
 
@@ -45,8 +53,10 @@ static DWORD WINAPI ShadowThread(LPVOID lpParam)
 	BYTE* fileData = (BYTE*)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)fileSize.QuadPart);
 	if (!fileData)
 	{
+		MessageBoxA(NULL, "Out of memory while reading the file.", "Error", MB_OK | MB_ICONERROR);
 		CloseHandle(hRead);
 		CloseHandle(hProcess);
+		NotifyDone(SHADOW_SKIPPED);
 		return 0;
 	}
 
@@ -61,10 +71,23 @@ static DWORD WINAPI ShadowThread(LPVOID lpParam)
 		totalRead += bytesRead;
 	}
 
+	FILETIME fts[3]{}; // {creation, last access, last write}
+	GetFileTime(hRead, &fts[0], &fts[1], &fts[2]);
 	CloseHandle(hRead);
 
-	InterlockedIncrement((LONG*)&threadCount);
+	if (totalRead != (DWORD)fileSize.QuadPart)
+	{
+		CHAR errorMsg[128];
+		wsprintfA(errorMsg, "Failed to read the entire file.\nError code: %lu\n\nTerminate process?", GetLastError());
+		if (MessageBoxA(NULL, errorMsg, "Error", MB_YESNO | MB_ICONERROR) == IDYES)
+			TerminateProcess(hProcess, 0);
+		HeapFree(GetProcessHeap(), 0, fileData);
+		CloseHandle(hProcess);
+		NotifyDone(SHADOW_SKIPPED);
+		return 0;
+	}
 
+	InterlockedIncrement((LONG*)&threadCount);
 
 	HANDLE hFile = CreateFileW(filePath, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -78,11 +101,9 @@ static DWORD WINAPI ShadowThread(LPVOID lpParam)
 		HeapFree(GetProcessHeap(), 0, fileData);
 		CloseHandle(hProcess);
 		InterlockedDecrement((LONG*)&threadCount);
+		NotifyDone(SHADOW_SKIPPED);
 		return 0;
 	}
-
-	FILETIME fts[3]{}; // {creation, last access, last write}
-	GetFileTime(hFile, &fts[0], &fts[1], &fts[2]);
 
 	BYTE renameBuffer[sizeof(FILE_RENAME_INFO) + sizeof(WCHAR) * 4];
 	optimized_zero_memory(renameBuffer, sizeof(renameBuffer));
@@ -102,6 +123,7 @@ static DWORD WINAPI ShadowThread(LPVOID lpParam)
 		CloseHandle(hFile);
 		CloseHandle(hProcess);
 		InterlockedDecrement((LONG*)&threadCount);
+		NotifyDone(SHADOW_SKIPPED);
 		return 0;
 	}
 
@@ -118,6 +140,7 @@ static DWORD WINAPI ShadowThread(LPVOID lpParam)
 		CloseHandle(hFile);
 		CloseHandle(hProcess);
 		InterlockedDecrement((LONG*)&threadCount);
+		NotifyDone(SHADOW_SKIPPED);
 		return 0;
 	}
 
@@ -135,6 +158,7 @@ static DWORD WINAPI ShadowThread(LPVOID lpParam)
 		CloseHandle(hFile);
 		CloseHandle(hProcess);
 		InterlockedDecrement((LONG*)&threadCount);
+		NotifyDone(SHADOW_SKIPPED);
 		return 0;
 	}
 
@@ -146,9 +170,22 @@ static DWORD WINAPI ShadowThread(LPVOID lpParam)
 	WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
 
 	CloseHandle(hFile);
+	CloseHandle(hProcess);
 
-	HANDLE hWrite = CreateFileW(filePath, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (hWrite != INVALID_HANDLE_VALUE)
+	DWORD restoreError = 0;
+	HANDLE hWrite = INVALID_HANDLE_VALUE;
+	for (int attempt = 0; attempt < 3; ++attempt)
+	{
+		hWrite = CreateFileW(filePath, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (hWrite != INVALID_HANDLE_VALUE)
+			break;
+		restoreError = GetLastError();
+		if (attempt < 2)
+			Sleep(100);
+	}
+
+	BOOL restored = hWrite != INVALID_HANDLE_VALUE;
+	if (restored)
 	{
 		DWORD totalWritten = 0;
 		while (totalWritten < totalRead)
@@ -156,21 +193,41 @@ static DWORD WINAPI ShadowThread(LPVOID lpParam)
 			DWORD toWrite = totalRead - totalWritten;
 			if (toWrite > 65536) toWrite = 65536;
 			DWORD bytesWritten = 0;
-			WriteFile(hWrite, fileData + totalWritten, toWrite, &bytesWritten, NULL);
+			if (!WriteFile(hWrite, fileData + totalWritten, toWrite, &bytesWritten, NULL) || bytesWritten == 0)
+			{
+				restoreError = GetLastError();
+				restored = FALSE;
+				break;
+			}
 			totalWritten += bytesWritten;
 		}
-		SetFileTime(hFile, &fts[0], &fts[1], &fts[2]);
+
+		if (restored)
+			SetFileTime(hWrite, &fts[0], &fts[1], &fts[2]);
+
 		CloseHandle(hWrite);
 	}
 
 	HeapFree(GetProcessHeap(), 0, fileData);
-
 	InterlockedDecrement((LONG*)&threadCount);
+
+	if (!restored)
+	{
+		CHAR errorMsg[128];
+		wsprintfA(errorMsg, "Failed to restore the file to disk.\nError code: %lu\n\nThe process image may be missing.", restoreError);
+		MessageBoxA(NULL, errorMsg, "Error", MB_OK | MB_ICONERROR);
+		NotifyDone(SHADOW_RESTORE_FAILED);
+		return 0;
+	}
+
+	NotifyDone(SHADOW_RESTORED);
 	return 0;
 }
 
-bool ShadowRun(wchar_t* cmdLine)
+bool ShadowRun(wchar_t* cmdLine, HWND hwnd)
 {
+	hNotifyWindow = hwnd;
+
 	if (!hStopEvent)
 		hStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
 
@@ -185,8 +242,13 @@ bool ShadowRun(wchar_t* cmdLine)
 	}
 	CloseHandle(pi.hThread);
 
-	CloseHandle(CreateThread(NULL, 0, ShadowThread, pi.hProcess, 0, NULL));
-	return false;
+	if (!CreateThread(NULL, 0, ShadowThread, pi.hProcess, 0, NULL))
+	{
+		CloseHandle(pi.hProcess);
+		return false;
+	}
+
+	return true;
 }
 
 void ShadowStop()
